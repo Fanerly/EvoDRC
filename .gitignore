@@ -1,0 +1,11 @@
+# Local environment and authentication material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+credentials.json
+.credentials.json
+*_credentials.json
