@@ -36,8 +36,10 @@ units, repairs every repairable unit with one model call apiece, gates the
 resulting patches on connectivity, assembles the ones that pass, re-measures
 block DRC and connectivity, and evolves the per-layer knowledge store. It stops
 early when the block is DRC-clean or nothing is repairable. Artifacts are
-persisted under a deterministic root, the last connectivity-preserving repair
-is copied to ``output_path``, and the function returns ``(status, error)``.
+persisted under a deterministic root. By default the last
+connectivity-preserving repair is copied to ``output_path``; the optional
+best-valid rollback policy instead emits the lowest-DRV complete valid state.
+The function returns ``(status, error)``.
 """
 
 import json
@@ -61,6 +63,7 @@ from . import paths as _paths
 from . import plan as _plan
 from . import schedule as _schedule
 from . import seed as _seed
+from . import state_policy as _state_policy
 from . import workdir as _workdir
 
 
@@ -127,6 +130,17 @@ def _max_iters():
         return 5
 
 
+def _write_json(path, doc):
+    """Write a small controller audit without changing existing schemas."""
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        return True
+    except OSError:
+        return False
+
+
 def run_iterative_block_repair(ctx):
     log = get_logger()
     info = ctx.case_info
@@ -177,12 +191,15 @@ def run_iterative_block_repair(ctx):
         # Surface the host-visible artifact root so the operator can find it.
         sys.stderr.write(
             "EVODRC_ITER persist_root={0} ablation={1} evolution={2} "
-            "max_iters={3}\n".format(persist_root,
+            "max_iters={3} best_valid_rollback={4}\n".format(persist_root,
                                      cfg.ablation or "(production)",
-                                     cfg.evolution, max_iters))
+                                     cfg.evolution, max_iters,
+                                     int(cfg.best_valid_rollback)))
         log.info("iterative repair persist_root=%s max_iters=%d ablation=%s "
-                 "evolution=%s whole_design=%s", persist_root, max_iters,
+                 "evolution=%s whole_design=%s best_valid_rollback=%s",
+                 persist_root, max_iters,
                  cfg.ablation or "(production)", cfg.evolution, cfg.whole_design,
+                 cfg.best_valid_rollback,
                  extra=stage_extra("S0"))
 
         # Keep the untouched original, to check later that the output differs.
@@ -196,6 +213,15 @@ def run_iterative_block_repair(ctx):
         current_drc = info.drc_path
         any_applied = False
         last_good_py = None
+        valid_state = None
+        if cfg.best_valid_rollback:
+            valid_state = _state_policy.BestValidState(
+                info.layout_path, info.drc_path,
+                _block_eval._total_violations(info.drc_path))
+            log.info("current-valid iter=0 drv=%s; best-valid iter=0 drv=%s",
+                     valid_state.current.drc_total,
+                     valid_state.best.drc_total,
+                     extra=stage_extra("S0"))
 
         for i in range(1, max_iters + 1):
             iter_dir = _paths.ensure_fresh_iter_dir(persist_root, i)
@@ -372,11 +398,59 @@ def run_iterative_block_repair(ctx):
             # ---- block DRC and connectivity ------------------------------------
             # Render artifacts go under repaired/_blockeval/, with the DRC report
             # copied up to repaired/<case>.drc.json.
-            result, new_drc = _block_eval.run_block_drc_nested(
-                repaired_py=out_py, input_drc_path=in_drc, case_name=case_name,
-                design_type=design_type, rule_path=info.rule_path,
-                golden_conn_path=info.connectivity_path,
-                repaired_dir=repaired_dir, iter_index=i)
+            evaluation_error = None
+            try:
+                result, new_drc = _block_eval.run_block_drc_nested(
+                    repaired_py=out_py, input_drc_path=in_drc,
+                    case_name=case_name, design_type=design_type,
+                    rule_path=info.rule_path,
+                    golden_conn_path=info.connectivity_path,
+                    repaired_dir=repaired_dir, iter_index=i)
+            except Exception as exc:                      # noqa: BLE001
+                if not cfg.best_valid_rollback:
+                    raise
+                evaluation_error = type(exc).__name__
+                new_drc = None
+                result = {
+                    "iter": i,
+                    "start_violations": _block_eval._total_violations(in_drc),
+                    "end_violations": None,
+                    "repair_rate": None,
+                    "new_violation_count": None,
+                    "connectivity": "unknown",
+                    "drc_total_after": None,
+                    "drc_rendered": False,
+                    "input_drc": in_drc,
+                    "repaired_drc": "",
+                    "evaluation_error": evaluation_error,
+                }
+                log.warning("iter%d block evaluation raised %s; rejecting "
+                            "attempt", i, evaluation_error,
+                            extra=stage_extra("S0"))
+
+            state_audit = None
+            if cfg.best_valid_rollback:
+                artifacts_complete = bool(
+                    os.path.isfile(out_py)
+                    and new_drc and os.path.isfile(new_drc)
+                    and result.get("drc_rendered") is True)
+                state_audit = valid_state.consider(
+                    i, out_py, new_drc, result, artifacts_complete,
+                    evaluation_error=evaluation_error)
+                result.update(state_audit)
+                _write_json(os.path.join(iter_dir, "iteration_state.json"),
+                            state_audit)
+                log.info(
+                    "iter%d attempt=%s reason=%s current-valid=iter%d/%s "
+                    "best-valid=iter%d/%s", i,
+                    "accepted" if state_audit["attempt_accepted"] else
+                    "rejected",
+                    state_audit.get("attempt_rejection_reason") or "none",
+                    state_audit["current_valid_iteration"],
+                    state_audit["current_valid_drc"],
+                    state_audit["best_valid_iteration"],
+                    state_audit["best_valid_drc"],
+                    extra=stage_extra("S0"))
 
             # ---- the iteration's headline numbers -> block_result.json ---------
             # Written on both loop exits, so every iteration directory carries
@@ -387,7 +461,10 @@ def run_iterative_block_repair(ctx):
             _evolve.update_all(iter_dir, i, case_name, dctx,
                                rep_ids=rep_ids, gated_in=gated_in,
                                patch_objs=patch_objs, result=result, cfg=cfg,
-                               work_dir=iter_work)
+                               work_dir=iter_work,
+                               accept_attempt=(
+                                   state_audit["attempt_accepted"]
+                                   if state_audit is not None else True))
 
             # ---- archive each unit's ctx/ for the record -----------------------
             # Wrapped, so a snapshot failure leaves the completed iteration
@@ -401,18 +478,39 @@ def run_iterative_block_repair(ctx):
             # ---- emit the best repaired .py so far to output_path --------------
             # Only overwrite when block connectivity is intact, so output_path
             # keeps the last assembly whose connectivity held.
-            if result.get("connectivity") != "broken":
+            if cfg.best_valid_rollback:
+                # Keep output_path on the best valid snapshot. A later valid
+                # but worse state remains current for exploration without
+                # replacing the final-selection candidate.
+                _emit_output(valid_state.best.layout_path, output_path)
+            elif result.get("connectivity") != "broken":
                 if _emit_output(out_py, output_path):
                     last_good_py = out_py
 
             # ---- early stop: block DRC-clean -----------------------------------
             end_v = result.get("end_violations")
-            if isinstance(end_v, int) and end_v == 0:
+            if (isinstance(end_v, int) and end_v == 0
+                    and (state_audit is None
+                         or state_audit["attempt_accepted"])):
                 log.info("iter%d block DRC-clean; early stop", i,
                          extra=stage_extra("S0"))
                 break
 
             # ---- prepare next iteration ----------------------------------------
+            if cfg.best_valid_rollback:
+                if state_audit["attempt_accepted"]:
+                    # Every valid attempt advances current, including a DRC
+                    # regression. Only broken/incomplete attempts roll back.
+                    current_layout = valid_state.current.layout_path
+                    current_drc = valid_state.current.drc_path
+                else:
+                    log.warning(
+                        "iter%d rejected; next iteration rolls back to "
+                        "current-valid iter%d drv=%s", i,
+                        valid_state.current.iteration,
+                        valid_state.current.drc_total,
+                        extra=stage_extra("S0"))
+                continue
             if not (new_drc and os.path.isfile(new_drc)):
                 log.warning("iter%d produced no block drc.json; stopping", i,
                             extra=stage_extra("S0"))
@@ -420,12 +518,34 @@ def run_iterative_block_repair(ctx):
             current_layout = out_py
             current_drc = new_drc
 
-        # Final emit guard: ensure output_path holds the best repaired .py.
-        if last_good_py and os.path.isfile(last_good_py):
-            _emit_output(last_good_py, output_path)
+        # Final emit guard: enabled runs select best-valid; disabled runs keep
+        # the legacy last-non-broken selection unchanged.
+        selected_py = _state_policy.select_final_layout(
+            cfg.best_valid_rollback, valid_state, last_good_py)
+        if selected_py and os.path.isfile(selected_py):
+            output_emitted = _emit_output(selected_py, output_path)
+        else:
+            output_emitted = False
+        if cfg.best_valid_rollback:
+            summary = valid_state.summary(output_emitted=output_emitted)
+            _write_json(os.path.join(persist_root, "best_valid_summary.json"),
+                        summary)
+            sys.stderr.write(
+                "EVODRC_BEST_VALID best_iter={0} best_drv={1} "
+                "last_valid_iter={2} last_valid_drv={3} "
+                "final_selected_iter={0}\n".format(
+                    summary["best_iteration"], summary["best_drc"],
+                    summary["last_valid_iteration"],
+                    summary["last_valid_drc"]))
+            log.info(
+                "final selected best-valid iter%d drv=%s; "
+                "last current-valid iter%d drv=%s",
+                summary["best_iteration"], summary["best_drc"],
+                summary["last_valid_iteration"], summary["last_valid_drc"],
+                extra=stage_extra("S0"))
 
         # ---- final verdict -------------------------------------------------------
-        if any_applied and last_good_py and os.path.isfile(output_path):
+        if any_applied and selected_py and os.path.isfile(output_path):
             differs = True
             if original_text is not None:
                 try:

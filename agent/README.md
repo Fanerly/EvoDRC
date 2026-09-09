@@ -100,12 +100,29 @@ Other useful keys:
 | `CU_DRC` | `1` | Arbitrate when two pieces edit the same shared thing |
 | `CU_DELTA_LE0` | `1` | Also accept repairs that break even, not just improvements |
 | `VIA_COMPETITION` | `1` | Arbitrate when two pieces edit the same via cell |
+| `EVODRC_ENABLE_BEST_VALID_ROLLBACK` | `0` | Optionally reject broken/incomplete block states and emit the lowest-DRV valid iteration |
 
 `evodrc.conf` also carries `EVODRC_PROMPT_MODE`, which selects the request format. Leave it at `exp3`.
 
 Environment variables win over the file, and the file wins over the built-in defaults. A missing file is fine — the defaults are the full method. A negative number is treated as a typo and falls back to the default, so you cannot accidentally switch a safety limit off. `MAX_ITERS` is the one exception: a value below 1 stops the run with an error rather than falling back.
 
 `MAX_CONCURRENT_CALLS` and `CALL_COOLDOWN_SECONDS` cover **every** AI call the round loop makes. They matter because one round can issue a lot of them: each piece costs one call, and each layer whose notes get updated costs up to six more — two note generators and a judge, each allowed `KNOW_ATTEMPTS` tries.
+
+### Optional best-valid rollback policy
+
+`EVODRC_ENABLE_BEST_VALID_ROLLBACK=0` is the default and preserves the
+published iteration and final-output policy. Set it to `1` in
+`agent/evodrc.conf` to enable the optional policy. A complete block evaluation
+whose connectivity is preserved always becomes the next iteration's input,
+even when its DRC count rises. Broken or incomplete attempts are recorded and
+the next iteration resumes from the most recent valid state. The lowest-DRV
+valid state is selected only at final output; equal totals retain the earlier
+iteration.
+
+Enabled runs add two compatible audit artifacts without changing
+`block_result.json`: `iter<N>/iteration_state.json` records each transition,
+and `best_valid_summary.json` records the best, last-valid and final-selected
+iterations. The same information is logged under `EVODRC_BEST_VALID`.
 
 ---
 

@@ -60,7 +60,8 @@ PROMPT_LEGACY = "legacy"
 _KEYS = ("ABLATION", "MAX_ITERS", "LEAF_CONCURRENCY", "EVODRC_PROMPT_MODE",
          "KNOW_CONCURRENCY", "KNOW_ATTEMPTS",
          "MAX_CONCURRENT_CALLS", "CALL_COOLDOWN_SECONDS",
-         "CU_DRC", "CU_DELTA_LE0", "VIA_COMPETITION")
+         "CU_DRC", "CU_DELTA_LE0", "VIA_COMPETITION",
+         "EVODRC_ENABLE_BEST_VALID_ROLLBACK")
 
 # These match seed.CLA_PROVENANCE and seed.COLD_START_PROVENANCE. They are
 # spelled out again here rather than imported so this module stays free of
@@ -99,6 +100,9 @@ _DEFAULTS = {
     "CU_DELTA_LE0": "1",
     # N-way isolated-cell DRC competition for shared via cells.
     "VIA_COMPETITION": "1",
+    # Optional 4A policy.  Off preserves the published iteration state and
+    # final-output behaviour exactly.
+    "EVODRC_ENABLE_BEST_VALID_ROLLBACK": "0",
 }
 
 _TRUE = ("1", "true", "yes", "on")
@@ -113,13 +117,15 @@ class RunConfig(object):
                  "know_concurrency", "know_attempts", "seed_dir", "evolution",
                  "provenance", "whole_design", "conf_path",
                  "cu_drc", "cu_delta_le0", "via_competition",
-                 "max_concurrent_calls", "call_cooldown_seconds")
+                 "max_concurrent_calls", "call_cooldown_seconds",
+                 "best_valid_rollback")
 
     def __init__(self, ablation, max_iters, leaf_concurrency, prompt_mode,
                  know_concurrency, know_attempts, seed_dir, evolution,
                  provenance, whole_design, conf_path,
                  cu_drc=True, cu_delta_le0=True, via_competition=True,
-                 max_concurrent_calls=5, call_cooldown_seconds=2.0):
+                 max_concurrent_calls=5, call_cooldown_seconds=2.0,
+                 best_valid_rollback=False):
         self.ablation = ablation
         self.max_iters = max_iters
         self.leaf_concurrency = leaf_concurrency
@@ -136,6 +142,7 @@ class RunConfig(object):
         self.via_competition = via_competition
         self.max_concurrent_calls = max_concurrent_calls
         self.call_cooldown_seconds = call_cooldown_seconds
+        self.best_valid_rollback = best_valid_rollback
 
     def as_dict(self):
         return dict((k, getattr(self, k)) for k in self.__slots__)
@@ -285,6 +292,8 @@ def resolve(env_writeback=True):
     cu_drc = _bool(_get("CU_DRC", file_cfg), True)
     cu_delta_le0 = _bool(_get("CU_DELTA_LE0", file_cfg), True)
     via_comp = _bool(_get("VIA_COMPETITION", file_cfg), True)
+    best_valid_rollback = _bool(
+        _get("EVODRC_ENABLE_BEST_VALID_ROLLBACK", file_cfg), False)
 
     seed_dir = os.path.join(agent_dir(), "knowledge", seed_subdir)
 
@@ -296,7 +305,8 @@ def resolve(env_writeback=True):
                     cu_drc=cu_drc, cu_delta_le0=cu_delta_le0,
                     via_competition=via_comp,
                     max_concurrent_calls=max_calls,
-                    call_cooldown_seconds=cooldown)
+                    call_cooldown_seconds=cooldown,
+                    best_valid_rollback=best_valid_rollback)
 
     if env_writeback:
         os.environ["ABLATION"] = cfg.ablation
@@ -317,4 +327,6 @@ def resolve(env_writeback=True):
         os.environ["CU_DRC"] = "1" if cfg.cu_drc else "0"
         os.environ["CU_DELTA_LE0"] = "1" if cfg.cu_delta_le0 else "0"
         os.environ["VIA_COMPETITION"] = "1" if cfg.via_competition else "0"
+        os.environ["EVODRC_ENABLE_BEST_VALID_ROLLBACK"] = (
+            "1" if cfg.best_valid_rollback else "0")
     return cfg

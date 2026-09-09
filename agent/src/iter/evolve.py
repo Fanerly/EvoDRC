@@ -450,6 +450,16 @@ def build_records(iter_dir, i, case, dctx, rep_ids, gated_in, patch_objs,
         n_cu = len(cu_records)
         records.extend(cu_records)
 
+    # The optional rollback controller marks whole-block attempts separately
+    # from their per-unit connectivity verdicts.  Rejected attempts remain in
+    # the iteration ledger for diagnosis, but callers can prevent them from
+    # being appended to the learned layer histories.
+    if "attempt_accepted" in (result or {}):
+        for record in records:
+            record["attempt_accepted"] = bool(result["attempt_accepted"])
+            record["attempt_rejection_reason"] = result.get(
+                "attempt_rejection_reason")
+
     mapped = [r for r in records if r["touched_layers"]]
     unmapped = [r for r in records if not r["touched_layers"]]
     touched = sorted({L for r in mapped for L in r["touched_layers"]},
@@ -1277,9 +1287,15 @@ def _write_audit(iter_dir, i, summary, cfg, per_layer=None, skipped=None):
 
 
 def update_all(iter_dir, i, case, dctx, rep_ids, gated_in, patch_objs,
-               result, cfg, *, work_dir):
+               result, cfg, *, work_dir, accept_attempt=True):
     """Build this iteration's records and, unless evolution is frozen, update
     the per-layer knowledge. Returns ``build_records``' summary dict.
+
+    When ``accept_attempt`` is false, the measured records are still written
+    to the iteration ledger with ``append=False``, but they are neither added
+    to layer history nor used to rewrite knowledge. This preserves a rejected
+    whole-block attempt for diagnosis without treating it as an accepted
+    design state.
 
     ``iter_dir`` addresses the published outputs -- ledger_summary.json,
     knowledge_update.json and the repaired DRC the history excerpt reads --
@@ -1288,7 +1304,12 @@ def update_all(iter_dir, i, case, dctx, rep_ids, gated_in, patch_objs,
     deck_map = layerdb.load_deck_map()
     summary = build_records(iter_dir, i, case, dctx, rep_ids, gated_in,
                             patch_objs, result, deck_map,
-                            append=(cfg.evolution == conf.EVOLUTION_ON))
+                            append=(cfg.evolution == conf.EVOLUTION_ON
+                                    and accept_attempt))
+    if not accept_attempt:
+        _write_audit(iter_dir, i, summary, cfg,
+                     skipped="attempt_rejected")
+        return summary
     if cfg.evolution == conf.EVOLUTION_FROZEN:
         # Return before resolving a backend and before rebuilding main.md.
         _write_audit(iter_dir, i, summary, cfg, skipped="ablation2_frozen")
