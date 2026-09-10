@@ -58,7 +58,7 @@ DEFAULT_WORK_BASE = "/tmp/evodrc_work"
 
 # The only entries a finished unit dir may contain; everything else at depth 1
 # is swept into the work dir. ``ctx`` is kept whole and never recursed into.
-UNIT_KEEP = ("ctx", "patch.json", "prompt.txt")
+UNIT_KEEP = ("ctx", "patch.json", "prompt.txt", "candidates")
 
 # Host-visible prefixes a work root may never live under.
 _BLOCKED = ("/workspace/temp", "/workspace/result", "/workspace/score",

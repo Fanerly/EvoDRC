@@ -450,6 +450,18 @@ def build_records(iter_dir, i, case, dctx, rep_ids, gated_in, patch_objs,
         n_cu = len(cu_records)
         records.extend(cu_records)
 
+    # A selected 4B candidate keeps its source in the ordinary unit ledger.
+    # The patch parser and assembler intentionally ignore these envelope-only
+    # fields; they are audit metadata, not geometry operations.
+    for record in records:
+        if record.get("channel") != "unit_gate":
+            continue
+        source = patch_objs.get(record.get("unit_id")) or {}
+        if "candidate_index" in source:
+            record["candidate_index"] = source.get("candidate_index")
+            record["stable_unit_signature"] = source.get(
+                "stable_unit_signature")
+
     # The optional rollback controller marks whole-block attempts separately
     # from their per-unit connectivity verdicts.  Rejected attempts remain in
     # the iteration ledger for diagnosis, but callers can prevent them from

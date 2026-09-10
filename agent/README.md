@@ -101,6 +101,14 @@ Other useful keys:
 | `CU_DELTA_LE0` | `1` | Also accept repairs that break even, not just improvements |
 | `VIA_COMPETITION` | `1` | Arbitrate when two pieces edit the same via cell |
 | `EVODRC_ENABLE_BEST_VALID_ROLLBACK` | `0` | Optionally reject broken/incomplete block states and emit the lowest-DRV valid iteration |
+| `EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE` | `0` | Generate bounded alternatives for selected difficult units; requires best-valid rollback |
+| `EVODRC_MULTI_CANDIDATE_COUNT` | `2` | Total candidates per selected unit; hard range 2–3 |
+| `EVODRC_MULTI_CANDIDATE_MAX_UNITS_PER_ITER` | `1` | Selected difficult units per iteration; hard range 1–2 |
+| `EVODRC_MULTI_CANDIDATE_MAX_EXTRA_CALLS_PER_ITER` | `1` | Calls beyond candidate 0 per iteration; hard range 1–4 |
+| `EVODRC_MULTI_CANDIDATE_MIN_DRV` | `50` | Owned-DRV threshold for the high-DRV trigger; hard range 1–10000 |
+| `EVODRC_MULTI_CANDIDATE_EMPTY_STREAK` | `2` | Consecutive candidate-0 empty patches before triggering; hard range 1–10 |
+| `EVODRC_MULTI_CANDIDATE_STAGNATION_ROUNDS` | `2` | Consecutive non-improving stable-signature rounds before triggering; hard range 1–10 |
+| `EVODRC_MULTI_CANDIDATE_ALLOW_PDN` | `1` | Allow a PDN unit to trigger below the DRV threshold |
 
 `evodrc.conf` also carries `EVODRC_PROMPT_MODE`, which selects the request format. Leave it at `exp3`.
 
@@ -123,6 +131,33 @@ Enabled runs add two compatible audit artifacts without changing
 `block_result.json`: `iter<N>/iteration_state.json` records each transition,
 and `best_valid_summary.json` records the best, last-valid and final-selected
 iterations. The same information is logged under `EVODRC_BEST_VALID`.
+
+### Optional limited multi-candidate search
+
+Set both `EVODRC_ENABLE_BEST_VALID_ROLLBACK=1` and
+`EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE=1` to enable 4A+4B. Enabling 4B without
+4A is rejected at startup. Candidate 0 uses the unchanged prompt, call id and
+single-candidate output path. Only centrally selected difficult units receive
+one or two sequential alternatives, bounded by the unit and extra-call
+budgets. Difficulty uses a stable signature over PDN identity, coarse region,
+rule set and editable object identities rather than a repair-unit id alone.
+
+Triggers are high owned-DRV count, allowed PDN status, a configured consecutive
+empty-patch or stagnation history, or conflict degree at least two. Extra
+candidates carry a short conservative/alternative-strategy suffix and write to
+isolated private paths. No alternative prompt is persisted.
+
+Selection requires parse, the deterministic validator, and connectivity.
+Extra candidates additionally require the existing faithful crop DRC; an
+operation that faithful geometry preview cannot represent is rejected instead
+of approximately scored. Candidates are ordered by fewer new DRVs, larger net
+DRV improvement, fewer operations, then lower candidate number. If faithful
+DRC is unavailable for every candidate, a legal candidate 0 is retained. An
+internal 4B error restores candidate 0 and resumes the original gate path.
+
+Triggered units add `candidates/candidate_<N>/patch.json`, a small generation
+record, and `candidate_verdicts.json`. Each iteration adds
+`candidate_plan.json`. These files contain no prompt or authentication data.
 
 ---
 

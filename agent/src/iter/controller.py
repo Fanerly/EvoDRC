@@ -32,14 +32,16 @@
 
 ``run_iterative_block_repair(ctx)`` runs up to MAX_ITERS rounds, configured by
 ``agent/evodrc.conf``. Each round decomposes the current block into repair
-units, repairs every repairable unit with one model call apiece, gates the
-resulting patches on connectivity, assembles the ones that pass, re-measures
-block DRC and connectivity, and evolves the per-layer knowledge store. It stops
-early when the block is DRC-clean or nothing is repairable. Artifacts are
-persisted under a deterministic root. By default the last
-connectivity-preserving repair is copied to ``output_path``; the optional
-best-valid rollback policy instead emits the lowest-DRV complete valid state.
-The function returns ``(status, error)``.
+units, repairs every repairable unit with one model call apiece by default,
+gates the resulting patches on connectivity, assembles the ones that pass,
+re-measures block DRC and connectivity, and evolves the per-layer knowledge
+store. The optional limited multi-candidate policy gives only selected
+difficult units a bounded number of alternatives. It stops early when the
+block is DRC-clean or nothing is repairable. Artifacts are persisted under a
+deterministic root. By default the last connectivity-preserving repair is
+copied to ``output_path``; the optional best-valid rollback policy instead
+emits the lowest-DRV complete valid state. The function returns ``(status,
+error)``.
 """
 
 import json
@@ -59,6 +61,7 @@ from . import evolve as _evolve
 from . import gate as _gate
 from . import inject as _inject
 from . import layerdb as _layerdb
+from . import multicandidate as _multicandidate
 from . import paths as _paths
 from . import plan as _plan
 from . import schedule as _schedule
@@ -191,15 +194,18 @@ def run_iterative_block_repair(ctx):
         # Surface the host-visible artifact root so the operator can find it.
         sys.stderr.write(
             "EVODRC_ITER persist_root={0} ablation={1} evolution={2} "
-            "max_iters={3} best_valid_rollback={4}\n".format(persist_root,
+            "max_iters={3} best_valid_rollback={4} "
+            "limited_multi_candidate={5}\n".format(persist_root,
                                      cfg.ablation or "(production)",
                                      cfg.evolution, max_iters,
-                                     int(cfg.best_valid_rollback)))
+                                     int(cfg.best_valid_rollback),
+                                     int(cfg.limited_multi_candidate)))
         log.info("iterative repair persist_root=%s max_iters=%d ablation=%s "
-                 "evolution=%s whole_design=%s best_valid_rollback=%s",
+                 "evolution=%s whole_design=%s best_valid_rollback=%s "
+                 "limited_multi_candidate=%s",
                  persist_root, max_iters,
                  cfg.ablation or "(production)", cfg.evolution, cfg.whole_design,
-                 cfg.best_valid_rollback,
+                 cfg.best_valid_rollback, cfg.limited_multi_candidate,
                  extra=stage_extra("S0"))
 
         # Keep the untouched original, to check later that the output differs.
@@ -214,6 +220,7 @@ def run_iterative_block_repair(ctx):
         any_applied = False
         last_good_py = None
         valid_state = None
+        difficulty_tracker = None
         if cfg.best_valid_rollback:
             valid_state = _state_policy.BestValidState(
                 info.layout_path, info.drc_path,
@@ -222,6 +229,19 @@ def run_iterative_block_repair(ctx):
                      valid_state.current.drc_total,
                      valid_state.best.drc_total,
                      extra=stage_extra("S0"))
+        if cfg.limited_multi_candidate:
+            difficulty_tracker = _multicandidate.DifficultyTracker()
+            log.info(
+                "limited multi-candidate budget: candidates=%d units=%d "
+                "extra_calls=%d min_drv=%d empty_streak=%d stagnation=%d "
+                "allow_pdn=%s", cfg.multi_candidate_count,
+                cfg.multi_candidate_max_units,
+                cfg.multi_candidate_max_extra_calls,
+                cfg.multi_candidate_min_drv,
+                cfg.multi_candidate_empty_streak,
+                cfg.multi_candidate_stagnation_rounds,
+                cfg.multi_candidate_allow_pdn,
+                extra=stage_extra("S0"))
 
         for i in range(1, max_iters + 1):
             iter_dir = _paths.ensure_fresh_iter_dir(persist_root, i)
@@ -306,6 +326,32 @@ def run_iterative_block_repair(ctx):
                                    work_dir=iter_work)
                 break
 
+            # ---- bounded difficult-unit candidate plan ------------------------
+            multi_plan = {}
+            if cfg.limited_multi_candidate:
+                repairable_set = set(rep_ids)
+                repairable_units = [
+                    u for u in units if u.get("unit_id") in repairable_set]
+                multi_plan = difficulty_tracker.plan_iteration(
+                    i, repairable_units, dctx, cfg)
+                plan_audit = {
+                    "iteration": i,
+                    "enabled": True,
+                    "candidate_count_limit": cfg.multi_candidate_count,
+                    "unit_limit": cfg.multi_candidate_max_units,
+                    "extra_call_limit": cfg.multi_candidate_max_extra_calls,
+                    "planned_extra_calls": sum(
+                        int(x.get("planned_extra_calls", 0) or 0)
+                        for x in multi_plan.values()),
+                    "units": [multi_plan[k] for k in sorted(multi_plan)],
+                }
+                _write_json(os.path.join(iter_dir, "candidate_plan.json"),
+                            plan_audit)
+                log.info("iter%d limited multi-candidate units=%d "
+                         "planned_extra_calls=%d", i, len(multi_plan),
+                         plan_audit["planned_extra_calls"],
+                         extra=stage_extra("S0"))
+
             # ---- repair every unit, scheduled under LEAF_CONCURRENCY ----------
             common = {
                 "iter_dir": iter_dir,
@@ -324,8 +370,98 @@ def run_iterative_block_repair(ctx):
                 "ablation": cfg.ablation,
                 "prompt_mode": cfg.prompt_mode,
                 "unions_map": unions_map,
+                "multi_candidate_plan": multi_plan,
             }
             _schedule.run_leaves(i, rep_ids, common, iter_work=iter_work)
+
+            # Candidate 0 is the unchanged single-call output. Observe it for
+            # stable empty-patch history, then faithfully evaluate alternatives
+            # only for the centrally budgeted difficult units.
+            if cfg.limited_multi_candidate:
+                for leaf_id in rep_ids:
+                    ld = os.path.join(iter_dir, "leaf", leaf_id)
+                    c0 = os.path.join(ld, "candidates", "candidate_0",
+                                      "patch.json")
+                    if not os.path.isfile(c0):
+                        c0 = os.path.join(ld, "patch.json")
+                    try:
+                        with open(c0, "r", encoding="utf-8") as fh:
+                            c0_obj = json.load(fh)
+                    except (OSError, ValueError):
+                        c0_obj = None
+                    leaf = dctx.leaves.get(leaf_id)
+                    if leaf is not None:
+                        difficulty_tracker.observe_candidate_zero(
+                            leaf_id, leaf, dctx, c0_obj)
+
+                for leaf_id in sorted(multi_plan):
+                    ld = os.path.join(iter_dir, "leaf", leaf_id)
+                    leaf = dctx.leaves.get(leaf_id)
+                    if leaf is None:
+                        continue
+                    c0 = os.path.join(ld, "candidates", "candidate_0",
+                                      "patch.json")
+                    if not os.path.isfile(c0):
+                        # Candidate generation failed before it could snapshot
+                        # candidate 0. Keep the already-written legacy patch
+                        # untouched and let the ordinary gate process it.
+                        fallback = {
+                            "iteration": i,
+                            "repair_unit_id": leaf_id,
+                            "stable_unit_signature": multi_plan[leaf_id].get(
+                                "stable_signature"),
+                            "trigger_reasons": multi_plan[leaf_id].get(
+                                "trigger_reasons") or [],
+                            "candidate_count": multi_plan[leaf_id].get(
+                                "candidate_count"),
+                            "selected_candidate": 0,
+                            "selection_reason": "candidate_0_snapshot_missing",
+                            "actual_extra_model_calls": 0,
+                        }
+                        _write_json(os.path.join(
+                            ld, "candidate_verdicts.json"), fallback)
+                        log.warning(
+                            "iter%d unit=%s multi-candidate snapshot missing; "
+                            "keeping original candidate 0", i, leaf_id,
+                            extra=stage_extra("S0"))
+                        continue
+                    try:
+                        audit = _multicandidate.evaluate_and_select(
+                            i, leaf_id, ld, leaf, dctx, input_text,
+                            info.connectivity_path, design_type,
+                            os.path.join(iter_work, "_multi", leaf_id),
+                            multi_plan[leaf_id])
+                        log.info(
+                            "iter%d unit=%s multi-candidate selected=%s "
+                            "reason=%s extra_calls=%d", i, leaf_id,
+                            audit.get("selected_candidate"),
+                            audit.get("selection_reason"),
+                            audit.get("actual_extra_model_calls", 0),
+                            extra=stage_extra("S0"))
+                    except Exception as exc:              # noqa: BLE001
+                        # A 4B internal failure restores candidate 0 byte for
+                        # byte and hands control to the original gate path.
+                        if os.path.isfile(c0):
+                            shutil.copyfile(c0, os.path.join(ld, "patch.json"))
+                        fallback = {
+                            "iteration": i,
+                            "repair_unit_id": leaf_id,
+                            "stable_unit_signature": multi_plan[leaf_id].get(
+                                "stable_signature"),
+                            "trigger_reasons": multi_plan[leaf_id].get(
+                                "trigger_reasons") or [],
+                            "candidate_count": multi_plan[leaf_id].get(
+                                "candidate_count"),
+                            "selected_candidate": 0,
+                            "selection_reason": "internal_error_fallback_0",
+                            "internal_error": type(exc).__name__,
+                        }
+                        _write_json(os.path.join(
+                            ld, "candidate_verdicts.json"), fallback)
+                        log.warning(
+                            "iter%d unit=%s multi-candidate internal %s; "
+                            "restored candidate 0", i, leaf_id,
+                            type(exc).__name__, extra=stage_extra("S0"))
 
             # ---- connectivity gate; no model calls -----------------------------
             gated_dir = os.path.join(iter_dir, "gated")

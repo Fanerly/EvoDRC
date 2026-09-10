@@ -37,10 +37,11 @@ pipe, so file-descriptor and process pressure stays bounded.
 
 That setting is only a per-phase sub-cap. The binding limit is the
 process-wide gate in ``throttle``: ``_run_one`` spawns its subprocess inside
-``throttle.call_slot``, so the global concurrency cap and the post-call
-cooldown apply to repair calls exactly as they do to knowledge calls. Each
-child makes one model call, so holding the slot for the child's lifetime
-bounds the in-flight calls conservatively.
+``throttle.call_slot``, so the global concurrency cap and the post-process
+cooldown apply to repair subprocesses exactly as they do to knowledge calls.
+Normally each child makes one model call. Optional bounded alternatives run
+sequentially inside the same child while that slot remains held, so they do
+not increase the number of in-flight repair subprocesses.
 """
 
 import os
@@ -89,6 +90,9 @@ def _run_one(leaf_id, iter_index, common, *, iter_work):
     unit_work = _workdir.unit_work_dir(iter_work, leaf_id)
     call_id = "{0}_iter{1}_{2}".format(
         common["case_name"], iter_index, leaf_id)
+    candidate_plan = (common.get("multi_candidate_plan") or {}).get(
+        leaf_id) or {}
+    candidate_count = int(candidate_plan.get("candidate_count", 1) or 1)
     cmd = [
         sys.executable, "-m", "agent.src.iter.leaf_runner",
         "--input-layout", common["input_layout"],
@@ -114,6 +118,7 @@ def _run_one(leaf_id, iter_index, common, *, iter_work):
         "--tc-dir", common.get("tc_dir", "") or "",
         "--ablation", common.get("ablation", "") or "",
         "--prompt-mode", common.get("prompt_mode", "exp3") or "exp3",
+        "--candidate-count", str(max(1, min(3, candidate_count))),
     ]
     # ---- union units: member list plus the solution-free metadata file ------
     # plan_units wrote host_union.<unit>.json into <iter_dir>/input, which is
@@ -173,8 +178,9 @@ def run_leaves(iter_index, leaf_ids, common, *, iter_work):
     ``common`` carries the settings shared by all leaves: iter_dir,
     input_layout, input_drc, case_name, design_type, conn_path, rule_path,
     skill_path, model, workspace, score_calls_dir, inject (the staged
-    knowledge paths), tc_dir, ablation, prompt_mode, and unions_map, whose
-    entries mark which units are dispatched as unions.
+    knowledge paths), tc_dir, ablation, prompt_mode, unions_map, whose entries
+    mark which units are dispatched as unions, and the optional bounded
+    multi_candidate_plan.
 
     The concurrency cap is read from the environment, which ``conf.resolve()``
     has already populated; the same environment is handed to every child.

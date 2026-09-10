@@ -90,6 +90,135 @@ def _write_patch_json(out_dir, leaf_id, ops, explanation):
         json.dump(obj, fh, indent=2)
 
 
+def _write_generation(path, doc):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def _ops_summary(ops):
+    """Small alternative-strategy hint; never embeds the full prior patch."""
+    out = []
+    for op in ops or []:
+        if not isinstance(op, dict):
+            continue
+        kind = str(op.get("op") or "?")
+        target = (op.get("polygon_id") or op.get("cell_name")
+                  or op.get("inst_id") or op.get("instance_id") or "?")
+        token = "{0}:{1}".format(kind, target)
+        if token not in out:
+            out.append(token)
+        if len(out) >= 8:
+            break
+    return ", ".join(out) or "no usable operations"
+
+
+def _alternative_guidance(index, prior_ops, patch_path):
+    if index == 1:
+        strategy = (
+            "Use a conservative local alternative with the fewest operations "
+            "that can address the target violations.")
+    else:
+        strategy = (
+            "Use a genuinely different geometric strategy or target while "
+            "remaining inside the same repair unit.")
+    return (
+        "\n\n## Limited alternative candidate {0}\n"
+        "{1} Do not merely repeat the earlier candidate's primary operation "
+        "and target when a valid alternative exists. Earlier operation/target "
+        "summary: {2}. Write only this independent candidate's patch to {3}.\n"
+        .format(index, strategy, _ops_summary(prior_ops), patch_path))
+
+
+def _generate_additional_candidates(args, backend, prompt_text, patch_path,
+                                    trace_path, status, parsed, ops,
+                                    explanation):
+    """Persist candidate 0 and generate at most two isolated alternatives."""
+    try:
+        candidate_count = max(1, min(3, int(args.candidate_count)))
+    except (TypeError, ValueError):
+        candidate_count = 1
+    if candidate_count <= 1:
+        return
+
+    root = os.path.join(args.out_dir, "candidates")
+    os.makedirs(root, exist_ok=True)
+    c0 = os.path.join(root, "candidate_0")
+    os.makedirs(c0, exist_ok=True)
+    _write_patch_json(c0, args.leaf_id, ops, explanation)
+    _write_generation(os.path.join(c0, "generation.json"), {
+        "candidate_index": 0,
+        "call_attempted": True,
+        "call_id": args.call_id,
+        "status": status,
+        "parsed": bool(parsed),
+        "n_ops": len(ops or []),
+        "guidance": "original_prompt",
+    })
+
+    prior_ops = list(ops or [])
+    for index in range(1, candidate_count):
+        public_dir = os.path.join(root, "candidate_{0}".format(index))
+        private_dir = os.path.join(
+            args.work_dir, "candidate_{0}".format(index))
+        os.makedirs(public_dir, exist_ok=True)
+        os.makedirs(private_dir, exist_ok=True)
+        raw_path = os.path.join(private_dir, "patch_raw.json")
+        alt_trace = os.path.join(private_dir, "trace.md")
+        call_id = "{0}_candidate_{1}".format(args.call_id, index)
+        alt_prompt = prompt_text.replace(patch_path, raw_path)
+        alt_prompt = alt_prompt.replace(trace_path, alt_trace)
+        alt_prompt += _alternative_guidance(
+            index, prior_ops, raw_path)
+
+        alt_result = None
+        try:
+            try:
+                alt_result = backend.call_agent(
+                    prompt_text=alt_prompt, output_path=None,
+                    model=args.model, workspace=(args.workspace or None),
+                    effort=(os.environ.get("CLAUDE_EFFORT") or None),
+                    call_id=call_id, temp_dir=private_dir)
+            except TypeError:
+                alt_result = backend.call_agent(
+                    alt_prompt, None, args.model,
+                    workspace=(args.workspace or None),
+                    effort=(os.environ.get("CLAUDE_EFFORT") or None),
+                    call_id=call_id, temp_dir=private_dir)
+        except Exception as exc:                          # noqa: BLE001
+            alt_result = {"status": "fail",
+                          "error_type": type(exc).__name__}
+
+        alt_status = (alt_result or {}).get("status", "fail")
+        try:
+            with open(raw_path, "r", encoding="utf-8") as fh:
+                raw_text = fh.read()
+        except OSError:
+            raw_text = None
+        alt_patch = None
+        if alt_status == "success" and raw_text:
+            alt_patch = parse_patch_from_file_text(raw_text, args.leaf_id)
+        alt_ops = list(alt_patch.ops or []) if alt_patch is not None else []
+        alt_explanation = (alt_patch.explanation or "") \
+            if alt_patch is not None else ""
+        _write_patch_json(public_dir, args.leaf_id, alt_ops,
+                          alt_explanation)
+        _write_generation(os.path.join(public_dir, "generation.json"), {
+            "candidate_index": index,
+            "call_attempted": True,
+            "call_id": call_id,
+            "status": alt_status,
+            "parsed": alt_patch is not None,
+            "n_ops": len(alt_ops),
+            "guidance": ("conservative_local" if index == 1
+                         else "alternative_geometry"),
+            "backend_error": bool((alt_result or {}).get("error")
+                                  or (alt_result or {}).get("error_type")),
+        })
+        _place_tokens(call_id, args.score_calls_dir, work_dir=args.work_dir)
+        prior_ops.extend(alt_ops)
+
+
 def _write_trace(out_dir, leaf_id, call_id, status, n_ops, explanation,
                  narration, error):
     lines = []
@@ -227,6 +356,8 @@ def main(argv=None):
                     help="'' | 1 | 2 | 3 (informational for the leaf)")
     ap.add_argument("--prompt-mode", default="exp3",
                     help="exp3 (default) | legacy")
+    ap.add_argument("--candidate-count", default="1",
+                    help="bounded total candidates for this unit (1..3)")
     # ---- union unit dispatch; schedule.py passes both or neither ----------
     ap.add_argument("--union-members", default="",
                     help="comma-separated member leaf ids of a UNION unit")
@@ -423,9 +554,11 @@ def _run_unit(args):
 
     ops = []
     explanation = ""
+    parsed = False
     if status == "success" and file_text:
         patch = parse_patch_from_file_text(file_text, leaf_id)
         if patch is not None:
+            parsed = True
             ops = list(patch.ops or [])
             explanation = patch.explanation or ""
 
@@ -433,6 +566,9 @@ def _run_unit(args):
     _write_trace(out_dir, leaf_id, call_id, status, len(ops),
                  explanation, narration, error)
     _place_tokens(call_id, args.score_calls_dir, work_dir=work_dir)
+    _generate_additional_candidates(
+        args, backend, prompt_text, patch_path, trace_path, status, parsed,
+        ops, explanation)
     return 0
 
 

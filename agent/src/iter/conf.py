@@ -61,7 +61,15 @@ _KEYS = ("ABLATION", "MAX_ITERS", "LEAF_CONCURRENCY", "EVODRC_PROMPT_MODE",
          "KNOW_CONCURRENCY", "KNOW_ATTEMPTS",
          "MAX_CONCURRENT_CALLS", "CALL_COOLDOWN_SECONDS",
          "CU_DRC", "CU_DELTA_LE0", "VIA_COMPETITION",
-         "EVODRC_ENABLE_BEST_VALID_ROLLBACK")
+         "EVODRC_ENABLE_BEST_VALID_ROLLBACK",
+         "EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE",
+         "EVODRC_MULTI_CANDIDATE_COUNT",
+         "EVODRC_MULTI_CANDIDATE_MAX_UNITS_PER_ITER",
+         "EVODRC_MULTI_CANDIDATE_MAX_EXTRA_CALLS_PER_ITER",
+         "EVODRC_MULTI_CANDIDATE_MIN_DRV",
+         "EVODRC_MULTI_CANDIDATE_EMPTY_STREAK",
+         "EVODRC_MULTI_CANDIDATE_STAGNATION_ROUNDS",
+         "EVODRC_MULTI_CANDIDATE_ALLOW_PDN")
 
 # These match seed.CLA_PROVENANCE and seed.COLD_START_PROVENANCE. They are
 # spelled out again here rather than imported so this module stays free of
@@ -103,7 +111,23 @@ _DEFAULTS = {
     # Optional 4A policy.  Off preserves the published iteration state and
     # final-output behaviour exactly.
     "EVODRC_ENABLE_BEST_VALID_ROLLBACK": "0",
+    # Optional 4B policy and its bounded per-iteration budget.
+    "EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE": "0",
+    "EVODRC_MULTI_CANDIDATE_COUNT": "2",
+    "EVODRC_MULTI_CANDIDATE_MAX_UNITS_PER_ITER": "1",
+    "EVODRC_MULTI_CANDIDATE_MAX_EXTRA_CALLS_PER_ITER": "1",
+    "EVODRC_MULTI_CANDIDATE_MIN_DRV": "50",
+    "EVODRC_MULTI_CANDIDATE_EMPTY_STREAK": "2",
+    "EVODRC_MULTI_CANDIDATE_STAGNATION_ROUNDS": "2",
+    "EVODRC_MULTI_CANDIDATE_ALLOW_PDN": "1",
 }
+
+# Hard ceilings prevent a malformed config from creating unbounded calls.
+MULTI_CANDIDATE_COUNT_MAX = 3
+MULTI_CANDIDATE_MAX_UNITS_HARD = 2
+MULTI_CANDIDATE_MAX_EXTRA_CALLS_HARD = 4
+MULTI_CANDIDATE_HISTORY_HARD = 10
+MULTI_CANDIDATE_MIN_DRV_HARD = 10000
 
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off")
@@ -118,14 +142,25 @@ class RunConfig(object):
                  "provenance", "whole_design", "conf_path",
                  "cu_drc", "cu_delta_le0", "via_competition",
                  "max_concurrent_calls", "call_cooldown_seconds",
-                 "best_valid_rollback")
+                 "best_valid_rollback", "limited_multi_candidate",
+                 "multi_candidate_count", "multi_candidate_max_units",
+                 "multi_candidate_max_extra_calls",
+                 "multi_candidate_min_drv", "multi_candidate_empty_streak",
+                 "multi_candidate_stagnation_rounds",
+                 "multi_candidate_allow_pdn")
 
     def __init__(self, ablation, max_iters, leaf_concurrency, prompt_mode,
                  know_concurrency, know_attempts, seed_dir, evolution,
                  provenance, whole_design, conf_path,
                  cu_drc=True, cu_delta_le0=True, via_competition=True,
                  max_concurrent_calls=5, call_cooldown_seconds=2.0,
-                 best_valid_rollback=False):
+                 best_valid_rollback=False, limited_multi_candidate=False,
+                 multi_candidate_count=2, multi_candidate_max_units=1,
+                 multi_candidate_max_extra_calls=1,
+                 multi_candidate_min_drv=50,
+                 multi_candidate_empty_streak=2,
+                 multi_candidate_stagnation_rounds=2,
+                 multi_candidate_allow_pdn=True):
         self.ablation = ablation
         self.max_iters = max_iters
         self.leaf_concurrency = leaf_concurrency
@@ -143,6 +178,16 @@ class RunConfig(object):
         self.max_concurrent_calls = max_concurrent_calls
         self.call_cooldown_seconds = call_cooldown_seconds
         self.best_valid_rollback = best_valid_rollback
+        self.limited_multi_candidate = limited_multi_candidate
+        self.multi_candidate_count = multi_candidate_count
+        self.multi_candidate_max_units = multi_candidate_max_units
+        self.multi_candidate_max_extra_calls = \
+            multi_candidate_max_extra_calls
+        self.multi_candidate_min_drv = multi_candidate_min_drv
+        self.multi_candidate_empty_streak = multi_candidate_empty_streak
+        self.multi_candidate_stagnation_rounds = \
+            multi_candidate_stagnation_rounds
+        self.multi_candidate_allow_pdn = multi_candidate_allow_pdn
 
     def as_dict(self):
         return dict((k, getattr(self, k)) for k in self.__slots__)
@@ -227,6 +272,12 @@ def _float_nonneg(value, default):
     return default if x < 0 else x
 
 
+def _int_bounded(value, default, lower, upper):
+    """Parse and clamp an integer to a closed, finite safety interval."""
+    n = _int(value, default)
+    return max(lower, min(upper, n))
+
+
 def _bool(value, default):
     """Accept 1/0, true/false, yes/no, on/off, case-insensitively.
 
@@ -294,6 +345,32 @@ def resolve(env_writeback=True):
     via_comp = _bool(_get("VIA_COMPETITION", file_cfg), True)
     best_valid_rollback = _bool(
         _get("EVODRC_ENABLE_BEST_VALID_ROLLBACK", file_cfg), False)
+    limited_multi_candidate = _bool(
+        _get("EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE", file_cfg), False)
+    if limited_multi_candidate and not best_valid_rollback:
+        raise RuntimeError(
+            "EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE=1 requires "
+            "EVODRC_ENABLE_BEST_VALID_ROLLBACK=1; refusing implicit 4A enable")
+    multi_candidate_count = _int_bounded(
+        _get("EVODRC_MULTI_CANDIDATE_COUNT", file_cfg), 2, 2,
+        MULTI_CANDIDATE_COUNT_MAX)
+    multi_candidate_max_units = _int_bounded(
+        _get("EVODRC_MULTI_CANDIDATE_MAX_UNITS_PER_ITER", file_cfg), 1, 1,
+        MULTI_CANDIDATE_MAX_UNITS_HARD)
+    multi_candidate_max_extra_calls = _int_bounded(
+        _get("EVODRC_MULTI_CANDIDATE_MAX_EXTRA_CALLS_PER_ITER", file_cfg),
+        1, 1, MULTI_CANDIDATE_MAX_EXTRA_CALLS_HARD)
+    multi_candidate_min_drv = _int_bounded(
+        _get("EVODRC_MULTI_CANDIDATE_MIN_DRV", file_cfg), 50, 1,
+        MULTI_CANDIDATE_MIN_DRV_HARD)
+    multi_candidate_empty_streak = _int_bounded(
+        _get("EVODRC_MULTI_CANDIDATE_EMPTY_STREAK", file_cfg), 2, 1,
+        MULTI_CANDIDATE_HISTORY_HARD)
+    multi_candidate_stagnation_rounds = _int_bounded(
+        _get("EVODRC_MULTI_CANDIDATE_STAGNATION_ROUNDS", file_cfg), 2, 1,
+        MULTI_CANDIDATE_HISTORY_HARD)
+    multi_candidate_allow_pdn = _bool(
+        _get("EVODRC_MULTI_CANDIDATE_ALLOW_PDN", file_cfg), True)
 
     seed_dir = os.path.join(agent_dir(), "knowledge", seed_subdir)
 
@@ -306,7 +383,18 @@ def resolve(env_writeback=True):
                     via_competition=via_comp,
                     max_concurrent_calls=max_calls,
                     call_cooldown_seconds=cooldown,
-                    best_valid_rollback=best_valid_rollback)
+                    best_valid_rollback=best_valid_rollback,
+                    limited_multi_candidate=limited_multi_candidate,
+                    multi_candidate_count=multi_candidate_count,
+                    multi_candidate_max_units=multi_candidate_max_units,
+                    multi_candidate_max_extra_calls=(
+                        multi_candidate_max_extra_calls),
+                    multi_candidate_min_drv=multi_candidate_min_drv,
+                    multi_candidate_empty_streak=(
+                        multi_candidate_empty_streak),
+                    multi_candidate_stagnation_rounds=(
+                        multi_candidate_stagnation_rounds),
+                    multi_candidate_allow_pdn=multi_candidate_allow_pdn)
 
     if env_writeback:
         os.environ["ABLATION"] = cfg.ablation
@@ -329,4 +417,20 @@ def resolve(env_writeback=True):
         os.environ["VIA_COMPETITION"] = "1" if cfg.via_competition else "0"
         os.environ["EVODRC_ENABLE_BEST_VALID_ROLLBACK"] = (
             "1" if cfg.best_valid_rollback else "0")
+        os.environ["EVODRC_ENABLE_LIMITED_MULTI_CANDIDATE"] = (
+            "1" if cfg.limited_multi_candidate else "0")
+        os.environ["EVODRC_MULTI_CANDIDATE_COUNT"] = str(
+            cfg.multi_candidate_count)
+        os.environ["EVODRC_MULTI_CANDIDATE_MAX_UNITS_PER_ITER"] = str(
+            cfg.multi_candidate_max_units)
+        os.environ["EVODRC_MULTI_CANDIDATE_MAX_EXTRA_CALLS_PER_ITER"] = str(
+            cfg.multi_candidate_max_extra_calls)
+        os.environ["EVODRC_MULTI_CANDIDATE_MIN_DRV"] = str(
+            cfg.multi_candidate_min_drv)
+        os.environ["EVODRC_MULTI_CANDIDATE_EMPTY_STREAK"] = str(
+            cfg.multi_candidate_empty_streak)
+        os.environ["EVODRC_MULTI_CANDIDATE_STAGNATION_ROUNDS"] = str(
+            cfg.multi_candidate_stagnation_rounds)
+        os.environ["EVODRC_MULTI_CANDIDATE_ALLOW_PDN"] = (
+            "1" if cfg.multi_candidate_allow_pdn else "0")
     return cfg
